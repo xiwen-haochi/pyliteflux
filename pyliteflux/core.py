@@ -208,6 +208,7 @@ class Config:
         self.tcp_host = "127.0.0.1"
         self.tcp_port = 8001
         self.info = True  # 添加info参数，控制日志打印
+        self.tcp_keep_alive = False  # Control if TCP connection keeps alive
 
     def validate_host(self, host: str) -> bool:
         """验证IP地址格式"""
@@ -339,10 +340,18 @@ class CustomHTTPServer(HTTPServer):
 class CustomTCPServer(ThreadingTCPServer):
     """自定义TCP服务器，支持任务队列"""
 
-    def __init__(self, server_address, RequestHandlerClass, task_queue=None, info=True):
+    def __init__(
+        self,
+        server_address,
+        RequestHandlerClass,
+        task_queue=None,
+        info=True,
+        server_instance=None,
+    ):
         super().__init__(server_address, RequestHandlerClass)
         self.task_queue = task_queue
         self.info = info
+        self.server_instance = server_instance
 
 
 class Middleware(ABC):
@@ -422,6 +431,7 @@ class Server:
         self.tcp_server = None
         self.task_queue = TaskQueue()
         self.middleware_manager = MiddlewareManager()  # 添加中间件管理器
+        self._active_connections = {}  # Store active TCP connections
 
     def handle_interrupt(self, signum, frame):
         """处理中断信号"""
@@ -458,9 +468,10 @@ class Server:
                 # 使用自定义TCP服务器
                 self.tcp_server = CustomTCPServer(
                     (self.config.tcp_host, self.config.tcp_port),
-                    partial(TCPHandler, server_instance=self),
+                    TCPHandler,
                     task_queue=self.task_queue,
                     info=self.config.info,
+                    server_instance=self,
                 )
                 threading.Thread(
                     target=self.tcp_server.serve_forever, daemon=True
@@ -498,6 +509,79 @@ class Server:
     def add_middleware(self, middleware: Middleware, protocol: str = "both"):
         """添加中间件"""
         self.middleware_manager.add_middleware(middleware, protocol)
+
+    def format_response(self, data: Any, data_type: str = "json") -> str:
+        """Format response data"""
+        if data_type == "json":
+            return json.dumps(data)
+        elif data_type == "xml":
+            # 简单的XML格式化
+            if isinstance(data, dict):
+                xml_parts = ["<response>"]
+                for key, value in data.items():
+                    xml_parts.append(f"<{key}>{value}</{key}>")
+                xml_parts.append("</response>")
+                return "\n".join(xml_parts)
+            return str(data)
+        else:
+            return str(data)
+
+    def push_message(self, message: str, client_id: Optional[str] = None):
+        """Push message to specific client or all clients"""
+        if client_id and client_id in self._active_connections:
+            try:
+                conn = self._active_connections[client_id]
+                # 检查连接是否有效
+                try:
+                    conn.getpeername()
+                except:
+                    self._remove_connection(client_id)
+                    return
+
+                response = self.format_response(
+                    {"type": "push", "data": message}, "json"
+                )
+                conn.sendall(response.encode())
+            except Exception as e:
+                Logger.error(
+                    f"Error pushing message to client {client_id}: {e}",
+                    self.config.info,
+                )
+                self._remove_connection(client_id)
+        elif not client_id:
+            # Push to all clients
+            disconnected = []
+            for cid, conn in list(self._active_connections.items()):
+                try:
+                    # 检查连接是否有效
+                    try:
+                        conn.getpeername()
+                    except:
+                        disconnected.append(cid)
+                        continue
+
+                    response = self.format_response(
+                        {"type": "push", "data": message}, "json"
+                    )
+                    conn.sendall(response.encode())
+                except Exception as e:
+                    Logger.error(
+                        f"Error pushing message to client {cid}: {e}", self.config.info
+                    )
+                    disconnected.append(cid)
+
+            # Remove disconnected clients
+            for cid in disconnected:
+                self._remove_connection(cid)
+
+    def _remove_connection(self, client_id: str):
+        """Remove a client connection"""
+        if client_id in self._active_connections:
+            try:
+                self._active_connections[client_id].close()
+            except:
+                pass
+            del self._active_connections[client_id]
 
 
 class HTTPHandler(BaseHTTPRequestHandler):
@@ -720,75 +804,113 @@ class TCPRequest:
 
 
 class TCPHandler(BaseRequestHandler):
-    def __init__(self, request, client_address, server, *, server_instance=None):
-        self.server_instance = server_instance
-        super().__init__(request, client_address, server)
+    @property
+    def server_instance(self):
+        """获取server实例"""
+        return self.server.server_instance
 
     def handle(self):
+        info = self.server.info if hasattr(self.server, "info") else True
+        client_id = f"{self.client_address[0]}:{self.client_address[1]}"
+
         try:
-            info = self.server.info if hasattr(self.server, "info") else True
-            Logger.info(
-                f"TCP Request from {self.client_address[0]}:{self.client_address[1]}",
-                info,
-            )
+            Logger.info(f"TCP connection established from {client_id}", info)
 
-            data = self.request.recv(1024).decode().strip()
-            Logger.info(f"Received data: {data}", info)
+            if self.server_instance.config.tcp_keep_alive:
+                self.server_instance._active_connections[client_id] = self.request
 
-            request = self.parse_request_data(data)
+            while True:
+                try:
+                    self.request.settimeout(1.0)
+                    data = self.request.recv(1024).decode().strip()
 
-            # 处理中间件请求
-            middleware_response = (
-                self.server_instance.middleware_manager.process_request(request, "tcp")
-            )
-            if middleware_response is not None:
-                response = self.format_response(middleware_response, request.data_type)
-                self.request.sendall(response.encode())
-                return
+                    if not data:
+                        break
 
-            if request.command in Route._routes["tcp"]:
-                handler = Route._routes["tcp"][request.command]
-                result = handler(request)
+                    Logger.info(f"Received data from {client_id}: {data}", info)
 
-                # 处理后台任务
-                for task, args, kwargs in request.bg.get_tasks():
-                    self.server_instance.task_queue.add_task(task, *args, **kwargs)
+                    request = self.parse_request_data(data)
 
-                # 处理中间件响应
-                result = self.server_instance.middleware_manager.process_response(
-                    request, result, "tcp"
-                )
-                response = self.format_response(result, request.data_type)
-                self.request.sendall(response.encode())
-            else:
-                error_response = {"error": "Command not found"}
-                error_response = (
-                    self.server_instance.middleware_manager.process_response(
-                        request, error_response, "tcp"
+                    middleware_response = (
+                        self.server_instance.middleware_manager.process_request(
+                            request, "tcp"
+                        )
                     )
-                )
-                response = self.format_response(error_response, request.data_type)
-                self.request.sendall(response.encode())
+                    if middleware_response is not None:
+                        response = self.server_instance.format_response(
+                            middleware_response, request.data_type
+                        )
+                        self.request.sendall(response.encode())
+                        if not self.server_instance.config.tcp_keep_alive:
+                            break
+                        continue
 
-        except Exception as e:
-            Logger.error(f"Error handling TCP request: {str(e)}", info)
-            Logger.error(traceback.format_exc(), info)
-            try:
-                error_response = {"error": str(e)}
-                error_response = (
-                    self.server_instance.middleware_manager.process_response(
-                        request, error_response, "tcp"
+                    if request.command in Route._routes["tcp"]:
+                        handler = Route._routes["tcp"][request.command]
+                        result = handler(request)
+
+                        for task, args, kwargs in request.bg.get_tasks():
+                            self.server_instance.task_queue.add_task(
+                                task, *args, **kwargs
+                            )
+
+                        result = (
+                            self.server_instance.middleware_manager.process_response(
+                                request, result, "tcp"
+                            )
+                        )
+                        response = self.server_instance.format_response(
+                            result, request.data_type
+                        )
+                        self.request.sendall(response.encode())
+                    else:
+                        error_response = {"error": "Command not found"}
+                        error_response = (
+                            self.server_instance.middleware_manager.process_response(
+                                request, error_response, "tcp"
+                            )
+                        )
+                        response = self.server_instance.format_response(
+                            error_response, request.data_type
+                        )
+                        self.request.sendall(response.encode())
+
+                    if not self.server_instance.config.tcp_keep_alive:
+                        break
+
+                except socket.timeout:
+                    if self.server_instance.config.tcp_keep_alive:
+                        continue
+                    break
+                except Exception as e:
+                    Logger.error(
+                        f"Error handling TCP request from {client_id}: {str(e)}", info
                     )
-                )
-                response = self.format_response(error_response, "json")
-                self.request.sendall(response.encode())
-            except:
-                pass
+                    Logger.error(traceback.format_exc(), info)
+                    try:
+                        error_response = {"error": str(e)}
+                        error_response = (
+                            self.server_instance.middleware_manager.process_response(
+                                request, error_response, "tcp"
+                            )
+                        )
+                        response = self.server_instance.format_response(
+                            error_response, "json"
+                        )
+                        self.request.sendall(response.encode())
+                    except:
+                        pass
+                    break
+
+        finally:
+            if client_id in self.server_instance._active_connections:
+                self.server_instance._remove_connection(client_id)
+            Logger.info(f"TCP connection closed from {client_id}", info)
 
     def parse_request_data(self, data: str) -> TCPRequest:
         """解析TCP请求数据"""
         try:
-            # 尝试解析为JSON
+            # 尝试析为JSON
             json_data = json.loads(data)
             if isinstance(json_data, dict) and "command" in json_data:
                 return TCPRequest(
