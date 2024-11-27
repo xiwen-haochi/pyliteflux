@@ -1,6 +1,6 @@
 # PyLiteFlux
 
-PyLiteFlux 是一个轻量级的Python Web/TCP服务器框架，完全基于Python标准库实现，不依赖任何第三方包。它支持HTTP和TCP协议，提供了简单而强大的API来构建网络应用。适合用于学习和理解Python后端框架的概念和实现原理。
+PyLiteFlux 是一个轻量级的Python Web/TCP服务器框架，完全基于Python标准库实现，不依赖任何第三方包。它支持HTTP和TCP协议。适合用于学习和理解Python后端框架的概念和实现原理。
 
 ## 特性
 
