@@ -640,7 +640,7 @@ def async_task(request):
 ## 注意事项
 
 1. TCP长连接需要显式启用：`server.config.tcp_keep_alive = True`
-2. 后台任务会在独立的线程池中��行
+2. 后台任务会在独立的线程池中
 3. 推送消息时如果不指定client_id，将广播给所有连接的客户端
 
 ## 许可证
